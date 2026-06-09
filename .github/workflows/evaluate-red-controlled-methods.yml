@@ -1,0 +1,75 @@
+name: RED controlled method smoke and benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      trials:
+        description: "Trials per controlled benchmark point"
+        required: false
+        default: "500"
+      rho_values:
+        description: "Comma-separated hidden correlation strengths"
+        required: false
+        default: "0.00,0.25,0.50,0.75,0.90,0.99"
+      gamma_values:
+        description: "Comma-separated RED-IF wrong-common-information scale factors"
+        required: false
+        default: "0.00,0.25,0.50,1.00,2.00,4.00"
+      omega_grid_size:
+        description: "Grid size for CI/ICI/GCI omega search"
+        required: false
+        default: "31"
+  pull_request:
+    paths:
+      - "tools/evaluation/**"
+      - "tests/**"
+      - ".github/workflows/evaluate-red-controlled-methods.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tools/evaluation/**"
+      - "tests/**"
+      - ".github/workflows/evaluate-red-controlled-methods.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  controlled-methods:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy matplotlib shapely pytest
+
+      - name: Unit/smoke tests
+        run: python -m pytest tests/test_controlled_red_methods.py
+
+      - name: Controlled benchmark
+        run: |
+          python tools/evaluation/run_controlled_unknown_corr_benchmark.py \
+            --suite all \
+            --trials "${{ github.event.inputs.trials || '500' }}" \
+            --rho-values "${{ github.event.inputs.rho_values || '0.00,0.25,0.50,0.75,0.90,0.99' }}" \
+            --gamma-values "${{ github.event.inputs.gamma_values || '0.00,0.25,0.50,1.00,2.00,4.00' }}" \
+            --methods oracle_correlated_red,red_normal,red_if_correct,red_if_wrong,parameter_ci,red_ci,red_ici,red_ci_esr,red_gci_esr,red_cu,red_ci_cu \
+            --omega-grid-size "${{ github.event.inputs.omega_grid_size || '31' }}" \
+            --out-dir evaluation_results/controlled_methods
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: red-controlled-method-results
+          path: evaluation_results/controlled_methods
+          if-no-files-found: error
