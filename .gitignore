@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+plots_unknown_corr/
+plots_unknown_corr_timing_probe/
+work_logs/
