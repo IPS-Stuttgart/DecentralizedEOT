@@ -49,14 +49,29 @@ def _parse_args() -> argparse.Namespace:
                         help="Grid points for CI/ICI omega optimization. Increase for final experiments.")
     parser.add_argument("--fixed-omega", type=float, default=None,
                         help="Set a fixed CI/ICI omega. Useful for debugging speed, e.g. 0.5.")
-    parser.add_argument("--omega-criterion", choices=["logdet", "trace"], default="logdet")
-    parser.add_argument("--component-weight-mode", choices=["likelihood", "prior", "uniform"], default="likelihood",
-                        help="How RED component weights are assigned after CI/ICI component fusion.")
+    parser.add_argument("--omega-criterion", choices=["logdet", "trace", "esr_trace", "esr_logdet"], default="logdet",
+                        help="Backward-compatible criterion used for both kinematics and shape if the split options are omitted.")
+    parser.add_argument("--kin-omega-criterion", choices=["logdet", "trace"], default=None,
+                        help="Optional separate CI/ICI omega objective for the 4-D kinematic state.")
+    parser.add_argument("--shape-omega-criterion", choices=["logdet", "trace", "esr_trace", "esr_logdet"], default=None,
+                        help="Optional separate CI/ICI omega objective for the 3-D shape state. "
+                             "The esr_* variants optimize in RED square-root shape space.")
+    parser.add_argument("--component-weight-mode",
+                        choices=["likelihood", "esr_likelihood", "chernoff", "prior", "uniform"],
+                        default="likelihood",
+                        help="How RED component weights are assigned after CI/ICI component fusion. "
+                             "chernoff gives GCI-style mixture weights for CI; esr_likelihood uses square-root-space compatibility.")
+    parser.add_argument("--component-pairing-mode", choices=["all", "best", "gated"], default="all",
+                        help="RED component-pair selection before mixture reduction.")
+    parser.add_argument("--component-gate-log-weight", type=float, default=12.0,
+                        help="For --component-pairing-mode gated, keep pairs within this log-score margin of the best pair per prior component.")
     parser.add_argument("--compatibility-scale", type=float, default=1.0,
                         help="Inflation factor in the compatibility likelihood used only for RED component weights.")
     parser.add_argument("--estimate-samples", type=int, default=1000,
                         help="Particles for MMGW/ESR point estimate. Lower for faster smoke tests.")
     parser.add_argument("--include-ici", action="store_true", help="Also evaluate experimental RED-ICI.")
+    parser.add_argument("--include-gci-esr", action="store_true",
+                        help="Also evaluate a proposed RED-GCI/ESR preset: CI, shape esr_trace omega, Chernoff weights, gated pairs.")
     return parser.parse_args()
 
 
@@ -169,9 +184,13 @@ def main() -> None:
         "color": "black",
         "unknown_corr_method": "ci",
         "omega_criterion": args.omega_criterion,
+        "kin_omega_criterion": args.kin_omega_criterion or args.omega_criterion,
+        "shape_omega_criterion": args.shape_omega_criterion or args.omega_criterion,
         "fixed_omega": args.fixed_omega,
         "omega_grid_size": args.omega_grid_size,
         "component_weight_mode": args.component_weight_mode,
+        "component_pairing_mode": args.component_pairing_mode,
+        "component_gate_log_weight": args.component_gate_log_weight,
         "compatibility_scale": args.compatibility_scale,
         "estimate_samples": args.estimate_samples,
     })
@@ -182,6 +201,20 @@ def main() -> None:
         FilterRecord("red_if", "RED information fusion", fusion_red_if),
         FilterRecord("red_ci", "RED-CI unknown corr.", fusion_red_ci),
     ]
+
+    if args.include_gci_esr:
+        config_red_gci_esr = dict(config_red_ci)
+        config_red_gci_esr.update({
+            "name": "RED-GCI/ESR unknown corr.",
+            "color": "purple",
+            "unknown_corr_method": "ci",
+            "kin_omega_criterion": "logdet",
+            "shape_omega_criterion": "esr_trace",
+            "component_weight_mode": "chernoff",
+            "component_pairing_mode": "gated",
+        })
+        fusion_red_gci_esr = UnknownCorrelationFusionCenter(**config_red_gci_esr)
+        records.append(FilterRecord("red_gci_esr", "RED-GCI/ESR unknown corr.", fusion_red_gci_esr))
 
     if args.include_ici:
         config_red_ici = dict(config_red_ci)
