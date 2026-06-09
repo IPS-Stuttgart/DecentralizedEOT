@@ -18,6 +18,8 @@ hard to isolate in the moving-target benchmark:
 * RED-CI / RED-ICI: unknown-correlation methods with RED chart alignment.
 * RED-CI-ESR / RED-GCI-ESR: geometry-aware variants for the square-root/MMGW
   shape representation.
+* RED-CU / RED-CI-CU: covariance-union safety variants for strongly
+  inconsistent local tracks or hidden biases.
 
 The state order matches the Göttingen RED-IF repository:
     [x, y, vx, vy, alpha, length, width]
@@ -61,6 +63,8 @@ DEFAULT_METHODS = [
     "red_ici",
     "red_ci_esr",
     "red_gci_esr",
+    "red_cu",
+    "red_ci_cu",
 ]
 
 METHOD_LABELS = {
@@ -73,6 +77,8 @@ METHOD_LABELS = {
     "red_ici": "RED-ICI",
     "red_ci_esr": "RED-CI-ESR",
     "red_gci_esr": "RED-GCI/ESR",
+    "red_cu": "RED-CU",
+    "red_ci_cu": "RED-CI-CU",
 }
 
 
@@ -215,6 +221,13 @@ def shape_sqrt_params(shape_state: np.ndarray) -> np.ndarray:
         (length - width) * s * c,
         length * s * s + width * c * c,
     ])
+
+
+def full_esr_transform(state: np.ndarray) -> np.ndarray:
+    out = np.zeros(STATE_DIM)
+    out[:4] = state[:4]
+    out[4:7] = shape_sqrt_params(state[[AL, L, W]])
+    return out
 
 
 def shape_sqrt_jacobian(shape_state: np.ndarray) -> np.ndarray:
@@ -439,6 +452,67 @@ def ici_at_omega(mean_a: np.ndarray, cov_a: np.ndarray, mean_b: np.ndarray, cov_
     return FusionOutput(mean=mean, covariance=cov, valid=valid, omega=float(omega))
 
 
+
+
+def local_chart_diff(mean: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    diff = np.asarray(mean, dtype=float) - np.asarray(reference, dtype=float)
+    if diff.shape[0] >= 7:
+        diff[AL] = angle_diff(mean[AL], reference[AL])
+    return diff
+
+
+def default_cu_gate_threshold(dim: int) -> float:
+    dim = max(int(dim), 1)
+    return float(dim * (1.0 - 2.0 / (9.0 * dim) + 1.96 * np.sqrt(2.0 / (9.0 * dim))) ** 3)
+
+
+def compatibility_nis(
+    mean_a: np.ndarray,
+    cov_a: np.ndarray,
+    mean_b: np.ndarray,
+    cov_b: np.ndarray,
+    *,
+    esr: bool = True,
+) -> float:
+    if esr:
+        diff = full_esr_transform(mean_b) - full_esr_transform(mean_a)
+        jac_a = full_esr_transform_jacobian(mean_a)
+        jac_b = full_esr_transform_jacobian(mean_b)
+        cov = ensure_spd(jac_a @ ensure_spd(cov_a) @ jac_a.T + jac_b @ ensure_spd(cov_b) @ jac_b.T)
+    else:
+        diff = local_chart_diff(mean_b, mean_a)
+        cov = ensure_spd(cov_a + cov_b)
+    return float(diff.T @ inv_spd(cov) @ diff)
+
+
+def covariance_union_inflate(
+    mean_f: np.ndarray,
+    cov_f: np.ndarray,
+    inputs: Sequence[Tuple[np.ndarray, np.ndarray]],
+    *,
+    margin: float = 1e-6,
+) -> np.ndarray:
+    """Scale a fused covariance so it covers input second moments.
+
+    This covariance-union-style step is used when local estimates disagree so
+    strongly that a sharp CI mean may not be a useful representation of the
+    unknown common truth.  It is deterministic and cheap; it is not a global
+    minimum-volume covariance union solver.
+    """
+
+    cov_f = ensure_spd(cov_f)
+    chol = np.linalg.cholesky(cov_f)
+    scale = 1.0
+    for mean_i, cov_i in inputs:
+        diff = local_chart_diff(mean_i, mean_f)
+        cover = ensure_spd(cov_i + np.outer(diff, diff))
+        whitened = np.linalg.solve(chol, cover)
+        whitened = np.linalg.solve(chol, whitened.T).T
+        eig_max = float(np.max(np.linalg.eigvalsh(symmetrize(whitened))))
+        if np.isfinite(eig_max):
+            scale = max(scale, eig_max)
+    return ensure_spd((1.0 + margin) * scale * cov_f)
+
 def ci_or_ici_fusion(
     mean_a: np.ndarray,
     cov_a: np.ndarray,
@@ -448,18 +522,37 @@ def ci_or_ici_fusion(
     method: str,
     criterion: str,
     grid_size: int,
+    cu_gate_threshold: Optional[float] = None,
+    cu_inflation_margin: float = 1e-6,
 ) -> FusionOutput:
     grid = np.linspace(0.0, 1.0, max(2, int(grid_size)))
     best: Optional[Tuple[float, FusionOutput]] = None
+    nominal = "ici" if method == "ici" else "ci"
     for omega in grid:
-        out = ci_at_omega(mean_a, cov_a, mean_b, cov_b, omega) if method == "ci" else ici_at_omega(mean_a, cov_a, mean_b, cov_b, omega)
+        out = ci_at_omega(mean_a, cov_a, mean_b, cov_b, omega) if nominal == "ci" else ici_at_omega(mean_a, cov_a, mean_b, cov_b, omega)
         obj = covariance_objective(out.covariance, out.mean, criterion)
         if not out.valid:
             obj += 1e6
         if best is None or obj < best[0]:
             best = (obj, out)
     assert best is not None
-    return best[1]
+    out = best[1]
+    if method in {"cu", "ci_cu"}:
+        gate = default_cu_gate_threshold(STATE_DIM) if cu_gate_threshold is None else float(cu_gate_threshold)
+        nis = compatibility_nis(mean_a, cov_a, mean_b, cov_b, esr=True)
+        if method == "cu" or nis > gate:
+            out = FusionOutput(
+                mean=out.mean,
+                covariance=covariance_union_inflate(
+                    out.mean,
+                    out.covariance,
+                    [(mean_a, cov_a), (mean_b, cov_b)],
+                    margin=cu_inflation_margin,
+                ),
+                valid=out.valid,
+                omega=out.omega,
+            )
+    return out
 
 
 def chernoff_log_normalizer(mean_a: np.ndarray, cov_a: np.ndarray, mean_b: np.ndarray, cov_b: np.ndarray, omega: float) -> float:
@@ -632,6 +725,16 @@ def fuse_method(method: str, trial: TrialInputs, gamma_wrong: float, omega_grid_
         return ci_or_ici_fusion(trial.est_a, trial.cov_a, b_aligned, cov_b_aligned, method="ci", criterion="esr_trace", grid_size=omega_grid_size)
     if method == "red_gci_esr":
         return red_gci_esr_fusion(trial.est_a, trial.cov_a, trial.est_b_observed, trial.cov_b_observed, grid_size=omega_grid_size)
+    if method == "red_cu":
+        return ci_or_ici_fusion(
+            trial.est_a, trial.cov_a, b_aligned, cov_b_aligned,
+            method="cu", criterion="esr_trace", grid_size=omega_grid_size,
+        )
+    if method == "red_ci_cu":
+        return ci_or_ici_fusion(
+            trial.est_a, trial.cov_a, b_aligned, cov_b_aligned,
+            method="ci_cu", criterion="esr_trace", grid_size=omega_grid_size,
+        )
     raise ValueError(method)
 
 

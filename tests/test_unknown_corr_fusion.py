@@ -11,6 +11,7 @@ from Filters.filtersupport import turn_mult
 from Filters.fusioncenter_unknowncorr import (
     align_shape_mean_to_reference,
     chernoff_log_normalizer,
+    covariance_union_inflate,
     fuse_gaussians_unknown_correlation,
     shape_sqrt_jacobian,
     shape_to_sqrt_params,
@@ -105,3 +106,50 @@ def test_esr_criterion_runs_for_shape_ci():
 
     assert 0.0 <= fused.omega <= 1.0
     assert np.all(np.linalg.eigvalsh(fused.covariance) > 0.0)
+
+
+
+def test_covariance_union_inflation_covers_separated_inputs():
+    mean_f = np.array([5.0, 0.0])
+    cov_f = np.eye(2)
+    mean_a = np.array([0.0, 0.0])
+    mean_b = np.array([10.0, 0.0])
+    cov = np.eye(2)
+
+    cov_u = covariance_union_inflate(mean_f, cov_f, [(mean_a, cov), (mean_b, cov)])
+
+    assert np.all(np.linalg.eigvalsh(cov_u) > 0.0)
+    assert cov_u[0, 0] > 25.0
+    for mean in (mean_a, mean_b):
+        diff = mean - mean_f
+        assert float(diff.T @ np.linalg.inv(cov_u) @ diff) < 1.0
+
+
+def test_ci_cu_uses_union_fallback_when_gate_is_tight():
+    mean_a = np.array([0.0, 0.0])
+    mean_b = np.array([10.0, 0.0])
+    cov = np.eye(2)
+
+    ci = fuse_gaussians_unknown_correlation(mean_a, cov, mean_b, cov, method="ci", fixed_omega=0.5)
+    ci_cu = fuse_gaussians_unknown_correlation(
+        mean_a,
+        cov,
+        mean_b,
+        cov,
+        method="ci_cu",
+        fixed_omega=0.5,
+        cu_gate_threshold=0.0,
+    )
+
+    np.testing.assert_allclose(ci_cu.mean, ci.mean, atol=1e-12)
+    assert np.linalg.det(ci_cu.covariance) > np.linalg.det(ci.covariance)
+
+
+def test_ci_cu_does_not_inflate_identical_inputs():
+    mean = np.array([0.3, 4.0, 1.5])
+    cov = np.diag([0.2, 0.5, 0.4])
+
+    ci_cu = fuse_gaussians_unknown_correlation(mean, cov, mean, cov, method="ci_cu", fixed_omega=0.5)
+
+    np.testing.assert_allclose(ci_cu.mean, mean, atol=1e-12)
+    np.testing.assert_allclose(ci_cu.covariance, cov, atol=1e-12)
