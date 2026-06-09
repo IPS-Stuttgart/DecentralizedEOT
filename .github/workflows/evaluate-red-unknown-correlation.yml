@@ -1,0 +1,247 @@
+name: RED unknown-correlation evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      tracking_runs:
+        description: "Monte Carlo runs for the repository tracking benchmark"
+        required: false
+        default: "100"
+      controlled_trials:
+        description: "Trials per point for controlled correlation/mismatch/ambiguity sweeps"
+        required: false
+        default: "500"
+      time_steps:
+        description: "Tracking benchmark time steps"
+        required: false
+        default: "15"
+      seed:
+        description: "Base random seed"
+        required: false
+        default: "7"
+      scenarios:
+        description: "Comma-separated original repo scenarios: 0=low orientation process noise, 1=high"
+        required: false
+        default: "0,1"
+      rho_values:
+        description: "Comma-separated common-information strengths for controlled sweep"
+        required: false
+        default: "0.00,0.25,0.50,0.75,0.90,0.99"
+      gamma_values:
+        description: "Comma-separated wrong-common-info scale factors for RED-IF mismatch sweep"
+        required: false
+        default: "0.00,0.25,0.50,1.00,2.00,4.00"
+      omega_grid_size:
+        description: "Grid size for CI/ICI omega optimization"
+        required: false
+        default: "31"
+      estimate_samples:
+        description: "Particles for MMGW/ESR estimates in tracking benchmark"
+        required: false
+        default: "1000"
+  pull_request:
+    paths:
+      - "Filters/**"
+      - "Data/**"
+      - "ErrorAndPlotting/**"
+      - "tests/**"
+      - "tools/evaluation/**"
+      - "run_red_unknown_corr_experiment.py"
+      - ".github/workflows/evaluate-red-unknown-correlation.yml"
+      - "constants.py"
+      - "configs.py"
+  push:
+    branches: [main]
+    paths:
+      - "Filters/**"
+      - "Data/**"
+      - "ErrorAndPlotting/**"
+      - "tests/**"
+      - "tools/evaluation/**"
+      - "run_red_unknown_corr_experiment.py"
+      - ".github/workflows/evaluate-red-unknown-correlation.yml"
+      - "constants.py"
+      - "configs.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: red-unknown-correlation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  RESULT_ROOT: evaluation_results
+  # Paper method set. The controlled benchmark implements all of these.
+  PAPER_METHODS: >-
+    oracle_correlated_red,red_normal,red_if_correct,red_if_wrong,
+    parameter_ci,red_ci,red_ici,red_ci_esr,red_gci_esr
+
+jobs:
+  smoke:
+    name: smoke tests and short evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy matplotlib shapely pytest tikzplotlib pandas
+
+      - name: Run unit tests if present
+        run: |
+          if [ -d tests ]; then
+            python -m pytest -q tests
+          else
+            echo "No tests/ directory present; skipping pytest."
+          fi
+
+      - name: Controlled unknown-correlation smoke sweep
+        run: |
+          mkdir -p "$RESULT_ROOT/smoke_controlled"
+          python tools/evaluation/run_controlled_unknown_corr_benchmark.py \
+            --suite all \
+            --trials 30 \
+            --seed 7 \
+            --rho-values 0.00,0.75,0.99 \
+            --gamma-values 0.50,1.00,2.00 \
+            --methods "$PAPER_METHODS" \
+            --omega-grid-size 11 \
+            --out-dir "$RESULT_ROOT/smoke_controlled"
+
+      - name: Repository tracking smoke benchmark
+        run: |
+          if [ ! -f run_red_unknown_corr_experiment.py ]; then
+            echo "run_red_unknown_corr_experiment.py not found. Apply the RED unknown-correlation patch before running the tracking benchmark."
+            exit 1
+          fi
+          mkdir -p "$RESULT_ROOT/smoke_tracking"
+          python run_red_unknown_corr_experiment.py \
+            --runs 5 \
+            --time-steps 8 \
+            --scenario 1 \
+            --seed 7 \
+            --omega-grid-size 11 \
+            --estimate-samples 100 \
+            --include-ici \
+            --include-gci-esr \
+            --out-dir "$RESULT_ROOT/smoke_tracking/scenario_1"
+
+      - name: Upload smoke artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: red-unknown-corr-smoke-${{ github.sha }}
+          path: ${{ env.RESULT_ROOT }}
+          if-no-files-found: warn
+
+  paper-evaluation:
+    name: workflow-dispatch paper evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy matplotlib shapely pytest tikzplotlib pandas
+
+      - name: Record evaluation configuration
+        run: |
+          mkdir -p "$RESULT_ROOT"
+          cat > "$RESULT_ROOT/evaluation_config.txt" <<EOF
+          commit=${GITHUB_SHA}
+          tracking_runs=${{ inputs.tracking_runs }}
+          controlled_trials=${{ inputs.controlled_trials }}
+          time_steps=${{ inputs.time_steps }}
+          seed=${{ inputs.seed }}
+          scenarios=${{ inputs.scenarios }}
+          rho_values=${{ inputs.rho_values }}
+          gamma_values=${{ inputs.gamma_values }}
+          omega_grid_size=${{ inputs.omega_grid_size }}
+          estimate_samples=${{ inputs.estimate_samples }}
+          methods=$PAPER_METHODS
+          EOF
+          cat "$RESULT_ROOT/evaluation_config.txt"
+
+      - name: Controlled correlation, RED-IF mismatch, and ambiguity suites
+        run: |
+          python tools/evaluation/run_controlled_unknown_corr_benchmark.py \
+            --suite all \
+            --trials "${{ inputs.controlled_trials }}" \
+            --seed "${{ inputs.seed }}" \
+            --rho-values "${{ inputs.rho_values }}" \
+            --gamma-values "${{ inputs.gamma_values }}" \
+            --methods "$PAPER_METHODS" \
+            --omega-grid-size "${{ inputs.omega_grid_size }}" \
+            --out-dir "$RESULT_ROOT/controlled"
+
+      - name: Original-repository tracking benchmark with RED-CI/ICI/GCI-ESR
+        run: |
+          if [ ! -f run_red_unknown_corr_experiment.py ]; then
+            echo "run_red_unknown_corr_experiment.py not found. Apply the RED unknown-correlation patch before running this job."
+            exit 1
+          fi
+          IFS=',' read -ra SCENARIOS <<< "${{ inputs.scenarios }}"
+          for SCENARIO in "${SCENARIOS[@]}"; do
+            SCENARIO="$(echo "$SCENARIO" | xargs)"
+            OUT="$RESULT_ROOT/tracking/scenario_${SCENARIO}"
+            mkdir -p "$OUT"
+            python run_red_unknown_corr_experiment.py \
+              --runs "${{ inputs.tracking_runs }}" \
+              --time-steps "${{ inputs.time_steps }}" \
+              --scenario "$SCENARIO" \
+              --seed "${{ inputs.seed }}" \
+              --omega-grid-size "${{ inputs.omega_grid_size }}" \
+              --estimate-samples "${{ inputs.estimate_samples }}" \
+              --include-ici \
+              --include-gci-esr \
+              --shape-omega-criterion esr_trace \
+              --component-weight-mode chernoff \
+              --component-pairing-mode gated \
+              --out-dir "$OUT"
+          done
+
+      - name: Build GitHub step summary
+        if: always()
+        run: |
+          echo "# RED unknown-correlation evaluation" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RESULT_ROOT/controlled/summary.md" ]; then
+            cat "$RESULT_ROOT/controlled/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "## Produced files" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          find "$RESULT_ROOT" -maxdepth 4 -type f | sort >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload paper-evaluation artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: red-unknown-corr-paper-eval-${{ github.sha }}
+          path: ${{ env.RESULT_ROOT }}
+          if-no-files-found: warn
