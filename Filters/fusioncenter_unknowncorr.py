@@ -9,20 +9,21 @@ main entry point is :class:`UnknownCorrelationFusionCenter`, which keeps
 the RED/MMGW machinery from the original repository but replaces the
 Kalman-style product update, and the RED-IF duplicate-information update,
 by component-wise covariance intersection (CI).  Experimental inverse
-covariance intersection (ICI), Chernoff/GCI component weighting, and
-ESR-geometry-aware CI weight selection are also provided.
+covariance intersection (ICI), covariance-union safety inflation (CU),
+Chernoff/GCI component weighting, and ESR-geometry-aware CI weight
+selection are also provided.
 
 The important assumption is different from the original RED-IF paper:
 we do not know the cross-covariance or exact common information between
 tracks.  Therefore, the fusion is intentionally conservative.  RED-IF is
 expected to be sharper when its known-common-information assumptions are
-correct; RED-CI/RED-GCI are fallbacks for the unknown-correlation case.
+correct; RED-CI/RED-GCI are fallbacks for the unknown-correlation case; RED-CI-CU adds a conservative safety valve for strongly inconsistent tracks.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 from numpy.random import multivariate_normal as mvn
@@ -37,7 +38,7 @@ from Filters.filtersupport import (
 )
 from constants import *
 
-UnknownCorrelationMethod = Literal["ci", "ici"]
+UnknownCorrelationMethod = Literal["ci", "ici", "cu", "ci_cu"]
 OmegaCriterion = Literal["logdet", "trace", "esr_trace", "esr_logdet"]
 ComponentWeightMode = Literal["likelihood", "esr_likelihood", "chernoff", "prior", "uniform"]
 ComponentPairingMode = Literal["all", "best", "gated"]
@@ -162,6 +163,101 @@ def _objective(cov: np.ndarray, criterion: OmegaCriterion, mean: Optional[np.nda
     raise ValueError(f"Unknown omega criterion: {criterion}")
 
 
+
+def _local_chart_diff(mean: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """Difference in the current local Gaussian chart.
+
+    For shape vectors, the orientation component is wrapped.  The function is
+    deliberately conservative for all other vector dimensions: it assumes the
+    caller has already aligned equivalent RED charts.
+    """
+
+    diff = np.asarray(mean, dtype=float) - np.asarray(reference, dtype=float)
+    if diff.shape[0] == 3:
+        diff[0] = ((diff[0] + np.pi) % (2.0 * np.pi)) - np.pi
+    return diff
+
+
+def _compatibility_nis(
+    mean_a: np.ndarray,
+    cov_a: np.ndarray,
+    mean_b: np.ndarray,
+    cov_b: np.ndarray,
+    *,
+    esr: bool = False,
+) -> float:
+    """Return a normalized discrepancy between two aligned Gaussian estimates.
+
+    For 3-D shape states and ``esr=True``, the discrepancy is measured in the
+    RED square-root shape space.  This makes the gate insensitive to equivalent
+    ellipse charts and less brittle near almost circular extents.
+    """
+
+    mean_a = np.asarray(mean_a, dtype=float)
+    mean_b = np.asarray(mean_b, dtype=float)
+    cov_a = _ensure_spd(cov_a)
+    cov_b = _ensure_spd(cov_b)
+
+    if esr and mean_a.shape[0] == 3:
+        diff = shape_to_sqrt_params(mean_b) - shape_to_sqrt_params(mean_a)
+        jac_a = shape_sqrt_jacobian(mean_a)
+        jac_b = shape_sqrt_jacobian(mean_b)
+        cov = _ensure_spd(jac_a @ cov_a @ jac_a.T + jac_b @ cov_b @ jac_b.T)
+    else:
+        diff = _local_chart_diff(mean_b, mean_a)
+        cov = _ensure_spd(cov_a + cov_b)
+    return float(diff.T @ _safe_inv(cov) @ diff)
+
+
+def _default_cu_gate_threshold(dim: int) -> float:
+    """Chi-square-like default gate without depending on scipy.stats.
+
+    The Wilson-Hilferty approximation here is intentionally loose.  It is only
+    used as a safety switch for CI-CU, not as a formal hypothesis test.
+    """
+
+    dim = max(int(dim), 1)
+    return float(dim * (1.0 - 2.0 / (9.0 * dim) + 1.96 * np.sqrt(2.0 / (9.0 * dim))) ** 3)
+
+
+def covariance_union_inflate(
+    mean_f: np.ndarray,
+    cov_f: np.ndarray,
+    inputs: Sequence[Tuple[np.ndarray, np.ndarray]],
+    *,
+    margin: float = 1e-6,
+) -> np.ndarray:
+    """Inflate a fused covariance so it covers all input Gaussian components.
+
+    This is a practical covariance-union-style safety step.  For a fixed fused
+    mean, each input component is represented by the second moment around that
+    fused mean,
+
+        C_i + (m_i - m_f)(m_i - m_f)^T.
+
+    We then scale ``cov_f`` by the smallest scalar found by a generalized
+    eigenvalue bound so that the scaled covariance dominates every such second
+    moment.  It is not the minimum-determinant covariance union over all means,
+    but it is simple, deterministic, and useful for inconsistent track pairs.
+    """
+
+    mean_f = np.asarray(mean_f, dtype=float)
+    cov_f = _ensure_spd(cov_f)
+    chol = np.linalg.cholesky(cov_f)
+    scale = 1.0
+    for mean_i, cov_i in inputs:
+        diff = _local_chart_diff(np.asarray(mean_i, dtype=float), mean_f)
+        cover = _ensure_spd(cov_i + np.outer(diff, diff))
+        # Compute eigenvalues of C_f^{-1/2} cover C_f^{-T/2} without forming
+        # an explicit inverse.
+        whitened = np.linalg.solve(chol, cover)
+        whitened = np.linalg.solve(chol, whitened.T).T
+        eig_max = float(np.max(np.linalg.eigvalsh(_symmetrize(whitened))))
+        if np.isfinite(eig_max):
+            scale = max(scale, eig_max)
+    return _ensure_spd((1.0 + float(margin)) * scale * cov_f)
+
+
 def _ci_at_omega(
     mean_a: np.ndarray,
     cov_a: np.ndarray,
@@ -255,6 +351,9 @@ def fuse_gaussians_unknown_correlation(
     criterion: OmegaCriterion = "logdet",
     fixed_omega: Optional[float] = None,
     grid_size: int = 31,
+    cu_gate_threshold: Optional[float] = None,
+    cu_inflation_margin: float = 1e-6,
+    cu_esr_gate: bool = True,
 ) -> FusionResult:
     """Fuse two Gaussian estimates without using a cross-covariance.
 
@@ -267,8 +366,10 @@ def fuse_gaussians_unknown_correlation(
         first one.  For REDs, use :func:`align_shape_mean_to_reference` before
         calling this function.
     method:
-        ``"ci"`` for covariance intersection or ``"ici"`` for inverse
-        covariance intersection.
+        ``"ci"`` for covariance intersection, ``"ici"`` for inverse
+        covariance intersection, ``"cu"`` for unconditional covariance-union
+        inflation around the CI mean, or ``"ci_cu"`` for CI with a
+        covariance-union safety fallback only when the inputs disagree.
     criterion:
         Objective used for choosing omega: covariance log determinant, trace,
         or a linearized ESR/square-root-space objective for 3-D shape states.
@@ -278,6 +379,14 @@ def fuse_gaussians_unknown_correlation(
     grid_size:
         Number of grid points in [0, 1] for omega selection when
         ``fixed_omega`` is not set.
+    cu_gate_threshold:
+        Gate for the CI-CU safety switch.  If omitted, a loose
+        chi-square-like threshold based on the state dimension is used.
+    cu_inflation_margin:
+        Extra multiplicative covariance inflation used by the covariance-union
+        safety step.
+    cu_esr_gate:
+        Use square-root ellipse geometry for the shape compatibility gate.
     """
 
     mean_a = np.asarray(mean_a, dtype=float)
@@ -285,38 +394,56 @@ def fuse_gaussians_unknown_correlation(
     cov_a = _ensure_spd(cov_a)
     cov_b = _ensure_spd(cov_b)
 
-    if method not in ("ci", "ici"):
+    if method not in ("ci", "ici", "cu", "ci_cu"):
         raise ValueError(f"Unknown unknown-correlation fusion method: {method}")
 
-    fuse_at = _ci_at_omega if method == "ci" else _ici_at_omega
+    # CU and CI-CU use CI as the nominal estimate, then inflate if needed.
+    fuse_at = _ici_at_omega if method == "ici" else _ci_at_omega
 
     if fixed_omega is not None:
         omega = float(np.clip(fixed_omega, 0.0, 1.0))
-        return fuse_at(mean_a, cov_a, mean_b, cov_b, omega)
+        best_result: Optional[FusionResult] = fuse_at(mean_a, cov_a, mean_b, cov_b, omega)
+    else:
+        # A small grid is deliberate: this function is called for every RED
+        # component pair in every Monte Carlo run.  Increase grid_size for final
+        # experiments if runtime is acceptable.
+        grid_size = max(int(grid_size), 2)
+        candidates = np.linspace(0.0, 1.0, grid_size)
+        best_value = np.inf
+        best_result = None
 
-    # A small grid is deliberate: this function is called for every RED
-    # component pair in every Monte Carlo run.  Increase grid_size for final
-    # experiments if runtime is acceptable.
-    grid_size = max(int(grid_size), 2)
-    candidates = np.linspace(0.0, 1.0, grid_size)
-    best_omega: Optional[float] = None
-    best_value = np.inf
-    for omega in candidates:
-        try:
-            result = fuse_at(mean_a, cov_a, mean_b, cov_b, float(omega))
-            value = _objective(result.covariance, criterion, result.mean)
-        except (np.linalg.LinAlgError, FloatingPointError, ValueError):
-            continue
-        if value < best_value:
-            best_value = value
-            best_omega = float(omega)
+        for omega in candidates:
+            try:
+                result = fuse_at(mean_a, cov_a, mean_b, cov_b, float(omega))
+                value = _objective(result.covariance, criterion, result.mean)
+            except (np.linalg.LinAlgError, FloatingPointError, ValueError):
+                continue
+            if value < best_value:
+                best_value = value
+                best_result = result
 
-    if best_omega is None:
-        # Very defensive fallback.  In practice this should not happen for CI
-        # with SPD input covariances.
-        return _ci_at_omega(mean_a, cov_a, mean_b, cov_b, 0.5)
+        if best_result is None:
+            # Very defensive fallback.  In practice this should not happen for CI
+            # with SPD input covariances.
+            best_result = _ci_at_omega(mean_a, cov_a, mean_b, cov_b, 0.5)
 
-    return fuse_at(mean_a, cov_a, mean_b, cov_b, best_omega)
+    if method in ("cu", "ci_cu"):
+        nis = _compatibility_nis(
+            mean_a, cov_a, mean_b, cov_b, esr=bool(cu_esr_gate)
+        )
+        gate = _default_cu_gate_threshold(mean_a.shape[0]) if cu_gate_threshold is None else float(cu_gate_threshold)
+        if method == "cu" or nis > gate:
+            best_result = FusionResult(
+                mean=best_result.mean,
+                covariance=covariance_union_inflate(
+                    best_result.mean,
+                    best_result.covariance,
+                    [(mean_a, cov_a), (mean_b, cov_b)],
+                    margin=cu_inflation_margin,
+                ),
+                omega=best_result.omega,
+            )
+    return best_result
 
 
 def wrap_angle_to_reference(angle: float, reference: float) -> float:
@@ -391,6 +518,9 @@ class UnknownCorrelationFusionCenter(FusionCenter):
         self._component_pairing_mode: ComponentPairingMode = kwargs.get("component_pairing_mode", "all")
         self._component_gate_log_weight: float = float(kwargs.get("component_gate_log_weight", 12.0))
         self._compatibility_scale: float = float(kwargs.get("compatibility_scale", 1.0))
+        self._cu_gate_threshold: Optional[float] = kwargs.get("cu_gate_threshold", None)
+        self._cu_inflation_margin: float = float(kwargs.get("cu_inflation_margin", 1e-6))
+        self._cu_esr_gate: bool = bool(kwargs.get("cu_esr_gate", True))
         self._estimate_samples: int = int(kwargs.get("estimate_samples", 1000))
 
         if self._component_pairing_mode not in ("all", "best", "gated"):
@@ -422,6 +552,9 @@ class UnknownCorrelationFusionCenter(FusionCenter):
             criterion=self._kin_omega_criterion,
             fixed_omega=self._fixed_omega,
             grid_size=self._omega_grid_size,
+            cu_gate_threshold=self._cu_gate_threshold,
+            cu_inflation_margin=self._cu_inflation_margin,
+            cu_esr_gate=False,
         )
         self._kin_state = kin_result.mean
         self._kin_cov = kin_result.covariance
@@ -474,6 +607,9 @@ class UnknownCorrelationFusionCenter(FusionCenter):
                     criterion=self._shape_omega_criterion,
                     fixed_omega=self._fixed_omega,
                     grid_size=self._omega_grid_size,
+                    cu_gate_threshold=self._cu_gate_threshold,
+                    cu_inflation_margin=self._cu_inflation_margin,
+                    cu_esr_gate=self._cu_esr_gate,
                 )
                 log_weight = self._component_log_weight(
                     prior_log_weight[i],
@@ -533,7 +669,7 @@ class UnknownCorrelationFusionCenter(FusionCenter):
         if self._component_weight_mode == "prior":
             return float(prior_log_weight + meas_log_weight)
         if self._component_weight_mode == "chernoff":
-            if self._unknown_corr_method == "ci":
+            if self._unknown_corr_method in ("ci", "cu", "ci_cu"):
                 return float(
                     prior_log_weight
                     + meas_log_weight

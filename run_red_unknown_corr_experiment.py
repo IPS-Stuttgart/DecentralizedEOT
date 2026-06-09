@@ -13,6 +13,7 @@ The script compares:
   * RED normal fusion        : original RED update, ignores track correlation.
   * RED information fusion   : original RED-IF update, known common information.
   * RED-CI unknown corr.     : new conservative unknown-correlation baseline.
+  * RED-CI-CU unknown corr.  : CI with covariance-union safety inflation for inconsistent tracks.
   * RED-ICI unknown corr.    : optional sharper experimental baseline.
 
 RED-IF should remain strong when its known-common-information assumptions are
@@ -67,8 +68,16 @@ def _parse_args() -> argparse.Namespace:
                         help="For --component-pairing-mode gated, keep pairs within this log-score margin of the best pair per prior component.")
     parser.add_argument("--compatibility-scale", type=float, default=1.0,
                         help="Inflation factor in the compatibility likelihood used only for RED component weights.")
+    parser.add_argument("--cu-gate-threshold", type=float, default=None,
+                        help="Optional NIS threshold for CI-CU covariance-union fallback. If omitted, a loose chi-square-like default is used.")
+    parser.add_argument("--cu-inflation-margin", type=float, default=1e-6,
+                        help="Extra multiplicative covariance inflation used by covariance-union safety variants.")
+    parser.add_argument("--cu-esr-gate", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use ESR/square-root shape-space compatibility for shape CI-CU gates.")
     parser.add_argument("--estimate-samples", type=int, default=1000,
                         help="Particles for MMGW/ESR point estimate. Lower for faster smoke tests.")
+    parser.add_argument("--include-ci-cu", action="store_true",
+                        help="Also evaluate RED-CI-CU: CI plus covariance-union safety inflation for inconsistent local tracks.")
     parser.add_argument("--include-ici", action="store_true", help="Also evaluate experimental RED-ICI.")
     parser.add_argument("--include-gci-esr", action="store_true",
                         help="Also evaluate a proposed RED-GCI/ESR preset: CI, shape esr_trace omega, Chernoff weights, gated pairs.")
@@ -192,6 +201,9 @@ def main() -> None:
         "component_pairing_mode": args.component_pairing_mode,
         "component_gate_log_weight": args.component_gate_log_weight,
         "compatibility_scale": args.compatibility_scale,
+        "cu_gate_threshold": args.cu_gate_threshold,
+        "cu_inflation_margin": args.cu_inflation_margin,
+        "cu_esr_gate": args.cu_esr_gate,
         "estimate_samples": args.estimate_samples,
     })
     fusion_red_ci = UnknownCorrelationFusionCenter(**config_red_ci)
@@ -201,6 +213,16 @@ def main() -> None:
         FilterRecord("red_if", "RED information fusion", fusion_red_if),
         FilterRecord("red_ci", "RED-CI unknown corr.", fusion_red_ci),
     ]
+
+    if args.include_ci_cu:
+        config_red_ci_cu = dict(config_red_ci)
+        config_red_ci_cu.update({
+            "name": "RED-CI-CU unknown corr.",
+            "color": "brown",
+            "unknown_corr_method": "ci_cu",
+        })
+        fusion_red_ci_cu = UnknownCorrelationFusionCenter(**config_red_ci_cu)
+        records.append(FilterRecord("red_ci_cu", "RED-CI-CU unknown corr.", fusion_red_ci_cu))
 
     if args.include_gci_esr:
         config_red_gci_esr = dict(config_red_ci)

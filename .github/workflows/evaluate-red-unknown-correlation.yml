@@ -76,7 +76,7 @@ env:
   # Paper method set. The controlled benchmark implements all of these.
   PAPER_METHODS: >-
     oracle_correlated_red,red_normal,red_if_correct,red_if_wrong,
-    parameter_ci,red_ci,red_ici,red_ci_esr,red_gci_esr
+    parameter_ci,red_ci,red_ici,red_ci_esr,red_gci_esr,red_cu,red_ci_cu
 
 jobs:
   smoke:
@@ -135,6 +135,7 @@ jobs:
             --estimate-samples 100 \
             --include-ici \
             --include-gci-esr \
+            --include-ci-cu \
             --out-dir "$RESULT_ROOT/smoke_tracking/scenario_1"
 
       - name: Upload smoke artifacts
@@ -216,6 +217,7 @@ jobs:
               --estimate-samples "${{ inputs.estimate_samples }}" \
               --include-ici \
               --include-gci-esr \
+              --include-ci-cu \
               --shape-omega-criterion esr_trace \
               --component-weight-mode chernoff \
               --component-pairing-mode gated \
