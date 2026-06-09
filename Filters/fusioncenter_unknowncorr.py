@@ -8,20 +8,21 @@ object estimates parameterized by orientation and semi-axis lengths.  The
 main entry point is :class:`UnknownCorrelationFusionCenter`, which keeps
 the RED/MMGW machinery from the original repository but replaces the
 Kalman-style product update, and the RED-IF duplicate-information update,
-by component-wise covariance intersection (CI).  An experimental inverse
-covariance intersection (ICI) option is also provided.
+by component-wise covariance intersection (CI).  Experimental inverse
+covariance intersection (ICI), Chernoff/GCI component weighting, and
+ESR-geometry-aware CI weight selection are also provided.
 
 The important assumption is different from the original RED-IF paper:
 we do not know the cross-covariance or exact common information between
 tracks.  Therefore, the fusion is intentionally conservative.  RED-IF is
 expected to be sharper when its known-common-information assumptions are
-correct; RED-CI is a fallback for the unknown-correlation case.
+correct; RED-CI/RED-GCI are fallbacks for the unknown-correlation case.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import numpy as np
 from numpy.random import multivariate_normal as mvn
@@ -37,8 +38,9 @@ from Filters.filtersupport import (
 from constants import *
 
 UnknownCorrelationMethod = Literal["ci", "ici"]
-OmegaCriterion = Literal["logdet", "trace"]
-ComponentWeightMode = Literal["likelihood", "prior", "uniform"]
+OmegaCriterion = Literal["logdet", "trace", "esr_trace", "esr_logdet"]
+ComponentWeightMode = Literal["likelihood", "esr_likelihood", "chernoff", "prior", "uniform"]
+ComponentPairingMode = Literal["all", "best", "gated"]
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,17 @@ class FusionResult:
 
     mean: np.ndarray
     covariance: np.ndarray
+    omega: float
+
+
+@dataclass(frozen=True)
+class _ShapeCandidate:
+    mean: np.ndarray
+    covariance: np.ndarray
+    log_weight: float
+    score: float
+    prior_id: int
+    meas_id: int
     omega: float
 
 
@@ -89,8 +102,59 @@ def _logdet_spd(mat: np.ndarray) -> float:
     return float(value)
 
 
-def _objective(cov: np.ndarray, criterion: OmegaCriterion) -> float:
+def shape_to_sqrt_params(shape_mean: np.ndarray) -> np.ndarray:
+    """Map [alpha, length, width] to symmetric square-root-matrix entries.
+
+    This is the RED/MMGW square-root-space transform used in the original
+    RED papers, but without the center and kinematic entries:
+
+        S = R(alpha) diag(length, width) R(alpha)^T
+        return [S_11, S_12, S_22]
+
+    The transform is invariant to the equivalent RED chart changes
+    [alpha, l, w] -> [alpha + pi/2, w, l] and [alpha + pi, l, w].
+    """
+
+    alpha, length, width = np.asarray(shape_mean, dtype=float)
+    c = np.cos(alpha)
+    s = np.sin(alpha)
+    return np.array([
+        length * c * c + width * s * s,
+        (length - width) * s * c,
+        length * s * s + width * c * c,
+    ])
+
+
+def shape_sqrt_jacobian(shape_mean: np.ndarray) -> np.ndarray:
+    """Jacobian of :func:`shape_to_sqrt_params` at [alpha, length, width]."""
+
+    alpha, length, width = np.asarray(shape_mean, dtype=float)
+    c = np.cos(alpha)
+    s = np.sin(alpha)
+    return np.array([
+        [2.0 * s * c * (width - length), c * c, s * s],
+        [(length - width) * (c * c - s * s), s * c, -s * c],
+        [2.0 * s * c * (length - width), s * s, c * c],
+    ])
+
+
+def _objective(cov: np.ndarray, criterion: OmegaCriterion, mean: Optional[np.ndarray] = None) -> float:
+    """Covariance-size objective for CI/ICI omega selection.
+
+    ``esr_trace`` and ``esr_logdet`` evaluate shape uncertainty after the
+    linearized RED square-root transform.  They are only meaningful for the
+    3-D shape vector [alpha, length, width].  If called for another state
+    dimension, the function falls back to the matching raw covariance
+    objective, making it safe to reuse for the kinematic state.
+    """
+
     cov = _ensure_spd(cov)
+    if criterion in ("esr_trace", "esr_logdet"):
+        if mean is not None and len(np.atleast_1d(mean)) == 3:
+            jac = shape_sqrt_jacobian(mean)
+            cov = _ensure_spd(jac @ cov @ jac.T)
+        criterion = "trace" if criterion == "esr_trace" else "logdet"
+
     if criterion == "trace":
         return float(np.trace(cov))
     if criterion == "logdet":
@@ -146,6 +210,41 @@ def _ici_at_omega(
     return FusionResult(mean=mean_f, covariance=_ensure_spd(cov_f), omega=float(omega))
 
 
+def chernoff_log_normalizer(
+    mean_a: np.ndarray,
+    cov_a: np.ndarray,
+    mean_b: np.ndarray,
+    cov_b: np.ndarray,
+    omega: float,
+) -> float:
+    """Log integral of N_a(x)^omega N_b(x)^(1-omega).
+
+    For Gaussian components, covariance intersection is equivalent to a
+    Chernoff/geometric-mean density fusion.  The normalization coefficient is
+    useful as a principled RED mixture-pair weight: components that disagree
+    receive a lower coefficient without assuming statistical independence.
+    """
+
+    mean_a = np.asarray(mean_a, dtype=float)
+    mean_b = np.asarray(mean_b, dtype=float)
+    cov_a = _ensure_spd(cov_a)
+    cov_b = _ensure_spd(cov_b)
+    inv_a = _safe_inv(cov_a)
+    inv_b = _safe_inv(cov_b)
+
+    info = omega * inv_a + (1.0 - omega) * inv_b
+    cov_f = _safe_inv(info)
+    y_f = omega * inv_a @ mean_a + (1.0 - omega) * inv_b @ mean_b
+
+    quad_inputs = (
+        omega * float(mean_a.T @ inv_a @ mean_a)
+        + (1.0 - omega) * float(mean_b.T @ inv_b @ mean_b)
+    )
+    quad_fused = float(y_f.T @ cov_f @ y_f)
+    weighted_logdet = omega * _logdet_spd(cov_a) + (1.0 - omega) * _logdet_spd(cov_b)
+    return float(0.5 * _logdet_spd(cov_f) - 0.5 * weighted_logdet + 0.5 * quad_fused - 0.5 * quad_inputs)
+
+
 def fuse_gaussians_unknown_correlation(
     mean_a: np.ndarray,
     cov_a: np.ndarray,
@@ -171,7 +270,8 @@ def fuse_gaussians_unknown_correlation(
         ``"ci"`` for covariance intersection or ``"ici"`` for inverse
         covariance intersection.
     criterion:
-        Objective used for choosing omega: covariance log determinant or trace.
+        Objective used for choosing omega: covariance log determinant, trace,
+        or a linearized ESR/square-root-space objective for 3-D shape states.
     fixed_omega:
         If provided, bypasses the grid search.  ``0.5`` is a useful fast
         diagnostic setting.
@@ -194,73 +294,27 @@ def fuse_gaussians_unknown_correlation(
         omega = float(np.clip(fixed_omega, 0.0, 1.0))
         return fuse_at(mean_a, cov_a, mean_b, cov_b, omega)
 
-    inv_a = _safe_inv(cov_a)
-    inv_b = _safe_inv(cov_b)
-    info_mean_a = inv_a @ mean_a
-    info_mean_b = inv_b @ mean_b
-
     # A small grid is deliberate: this function is called for every RED
     # component pair in every Monte Carlo run.  Increase grid_size for final
     # experiments if runtime is acceptable.
     grid_size = max(int(grid_size), 2)
     candidates = np.linspace(0.0, 1.0, grid_size)
     best_omega: Optional[float] = None
-
-    try:
-        omega_weights = candidates[:, None, None]
-        if method == "ci":
-            info_grid = omega_weights * inv_a + (1.0 - omega_weights) * inv_b
-        else:
-            common_bound_grid = _symmetrize(omega_weights * cov_a + (1.0 - omega_weights) * cov_b)
-            inv_common_bound_grid = np.linalg.inv(common_bound_grid)
-            info_grid = inv_a + inv_b - inv_common_bound_grid
-
-        if criterion == "logdet":
-            signs, logdets = np.linalg.slogdet(info_grid)
-            if method == "ici" and np.any(signs <= 0):
-                raise np.linalg.LinAlgError("non-SPD ICI information matrix")
-            values = np.where(signs > 0, -logdets, np.inf)
-        elif criterion == "trace":
-            cov_grid = np.linalg.inv(info_grid)
-            values = np.trace(cov_grid, axis1=1, axis2=2)
-        else:
-            raise ValueError(f"Unknown omega criterion: {criterion}")
-
-        if np.any(np.isfinite(values)):
-            best_omega = float(candidates[int(np.nanargmin(values))])
-    except (np.linalg.LinAlgError, FloatingPointError, ValueError):
-        best_value = np.inf
-        for omega in candidates:
-            try:
-                if method == "ci":
-                    info = omega * inv_a + (1.0 - omega) * inv_b
-                else:
-                    common_bound = _ensure_spd(omega * cov_a + (1.0 - omega) * cov_b)
-                    inv_common_bound = _safe_inv(common_bound)
-                    info = inv_a + inv_b - inv_common_bound
-
-                if criterion == "logdet":
-                    value = -_logdet_spd(info)
-                elif criterion == "trace":
-                    value = float(np.trace(_safe_inv(info)))
-                else:
-                    raise ValueError(f"Unknown omega criterion: {criterion}")
-            except (np.linalg.LinAlgError, FloatingPointError, ValueError):
-                continue
-            if value < best_value:
-                best_value = value
-                best_omega = float(omega)
+    best_value = np.inf
+    for omega in candidates:
+        try:
+            result = fuse_at(mean_a, cov_a, mean_b, cov_b, float(omega))
+            value = _objective(result.covariance, criterion, result.mean)
+        except (np.linalg.LinAlgError, FloatingPointError, ValueError):
+            continue
+        if value < best_value:
+            best_value = value
+            best_omega = float(omega)
 
     if best_omega is None:
         # Very defensive fallback.  In practice this should not happen for CI
         # with SPD input covariances.
         return _ci_at_omega(mean_a, cov_a, mean_b, cov_b, 0.5)
-
-    if method == "ci":
-        info = best_omega * inv_a + (1.0 - best_omega) * inv_b
-        cov_f = _safe_inv(info)
-        mean_f = cov_f @ (best_omega * info_mean_a + (1.0 - best_omega) * info_mean_b)
-        return FusionResult(mean=mean_f, covariance=_ensure_spd(cov_f), omega=best_omega)
 
     return fuse_at(mean_a, cov_a, mean_b, cov_b, best_omega)
 
@@ -294,6 +348,23 @@ def _log_gaussian_pdf(diff: np.ndarray, cov: np.ndarray) -> float:
     )
 
 
+def _esr_log_gaussian_compatibility(
+    mean_a: np.ndarray,
+    cov_a: np.ndarray,
+    mean_b: np.ndarray,
+    cov_b: np.ndarray,
+    scale: float = 1.0,
+) -> float:
+    """Approximate component compatibility in RED square-root space."""
+
+    ta = shape_to_sqrt_params(mean_a)
+    tb = shape_to_sqrt_params(mean_b)
+    ja = shape_sqrt_jacobian(mean_a)
+    jb = shape_sqrt_jacobian(mean_b)
+    cov_t = scale * (ja @ _ensure_spd(cov_a) @ ja.T + jb @ _ensure_spd(cov_b) @ jb.T)
+    return _log_gaussian_pdf(tb - ta, cov_t)
+
+
 class UnknownCorrelationFusionCenter(FusionCenter):
     """Fusion center for RED track-to-track fusion under unknown correlation.
 
@@ -310,12 +381,20 @@ class UnknownCorrelationFusionCenter(FusionCenter):
         super().__init__(**kwargs)
 
         self._unknown_corr_method: UnknownCorrelationMethod = kwargs.get("unknown_corr_method", "ci")
+        # Backward compatible: old scripts can keep using omega_criterion for both parts.
         self._omega_criterion: OmegaCriterion = kwargs.get("omega_criterion", "logdet")
+        self._kin_omega_criterion: OmegaCriterion = kwargs.get("kin_omega_criterion", self._omega_criterion)
+        self._shape_omega_criterion: OmegaCriterion = kwargs.get("shape_omega_criterion", self._omega_criterion)
         self._fixed_omega: Optional[float] = kwargs.get("fixed_omega", None)
         self._omega_grid_size: int = kwargs.get("omega_grid_size", 31)
         self._component_weight_mode: ComponentWeightMode = kwargs.get("component_weight_mode", "likelihood")
+        self._component_pairing_mode: ComponentPairingMode = kwargs.get("component_pairing_mode", "all")
+        self._component_gate_log_weight: float = float(kwargs.get("component_gate_log_weight", 12.0))
         self._compatibility_scale: float = float(kwargs.get("compatibility_scale", 1.0))
         self._estimate_samples: int = int(kwargs.get("estimate_samples", 1000))
+
+        if self._component_pairing_mode not in ("all", "best", "gated"):
+            raise ValueError(f"Unknown component_pairing_mode: {self._component_pairing_mode}")
 
         # The original constructor initializes a single Gaussian shape.  For an
         # unknown-correlation RED experiment, start directly in RED form.
@@ -340,7 +419,7 @@ class UnknownCorrelationFusionCenter(FusionCenter):
             est[[X1, X2, V1, V2]],
             est_cov[:4, :4],
             method=self._unknown_corr_method,
-            criterion=self._omega_criterion,
+            criterion=self._kin_omega_criterion,
             fixed_omega=self._fixed_omega,
             grid_size=self._omega_grid_size,
         )
@@ -350,16 +429,35 @@ class UnknownCorrelationFusionCenter(FusionCenter):
         # Shape part: RED component alignment followed by component-wise CI/ICI.
         shape_est, shape_est_cov, shape_est_weight = turn_mult(est[[AL, L, W]], est_cov[4:, 4:])
 
+        candidates = self._build_shape_candidates(shape_est, shape_est_cov, shape_est_weight)
+        candidates = self._select_shape_candidates(candidates)
+
+        if not candidates:
+            # Defensive fallback: preserve the prior RED if all candidates were
+            # numerically rejected.  This should not happen with sane input.
+            return
+
+        self._shape_state = np.array([c.mean for c in candidates])
+        self._shape_cov = np.array([c.covariance for c in candidates])
+        if self._component_weight_mode == "uniform":
+            self._shape_weight = np.ones(len(candidates)) / len(candidates)
+        else:
+            log_w = np.array([c.log_weight for c in candidates])
+            log_w -= lse(log_w)
+            self._shape_weight = np.exp(log_w)
+
+    def _build_shape_candidates(
+        self,
+        shape_est: np.ndarray,
+        shape_est_cov: np.ndarray,
+        shape_est_weight: np.ndarray,
+    ) -> List[_ShapeCandidate]:
         n_prior = len(self._shape_weight)
         n_meas = len(shape_est_weight)
-        new_shape_state = np.zeros((n_prior * n_meas, 3))
-        new_shape_cov = np.zeros((n_prior * n_meas, 3, 3))
-        new_log_weight = np.zeros(n_prior * n_meas)
-
         prior_log_weight = np.log(np.maximum(self._shape_weight, np.finfo(float).tiny))
         meas_log_weight = np.log(np.maximum(shape_est_weight, np.finfo(float).tiny))
 
-        out_id = 0
+        candidates: List[_ShapeCandidate] = []
         for i in range(n_prior):
             prior_mean = self._shape_state[i]
             prior_cov = self._shape_cov[i]
@@ -373,24 +471,52 @@ class UnknownCorrelationFusionCenter(FusionCenter):
                     meas_mean,
                     meas_cov,
                     method=self._unknown_corr_method,
-                    criterion=self._omega_criterion,
+                    criterion=self._shape_omega_criterion,
                     fixed_omega=self._fixed_omega,
                     grid_size=self._omega_grid_size,
                 )
-                new_shape_state[out_id] = result.mean
-                new_shape_cov[out_id] = result.covariance
-                new_log_weight[out_id] = self._component_log_weight(
+                log_weight = self._component_log_weight(
+                    prior_log_weight[i],
+                    meas_log_weight[j],
+                    prior_mean,
+                    prior_cov,
+                    meas_mean,
+                    meas_cov,
+                    result.omega,
+                )
+                score = self._component_pairing_score(
                     prior_log_weight[i], meas_log_weight[j], prior_mean, prior_cov, meas_mean, meas_cov
                 )
-                out_id += 1
+                candidates.append(_ShapeCandidate(
+                    mean=result.mean,
+                    covariance=result.covariance,
+                    log_weight=log_weight,
+                    score=score,
+                    prior_id=i,
+                    meas_id=j,
+                    omega=result.omega,
+                ))
+        return candidates
 
-        if self._component_weight_mode == "uniform":
-            self._shape_weight = np.ones_like(new_log_weight) / len(new_log_weight)
-        else:
-            new_log_weight -= lse(new_log_weight)
-            self._shape_weight = np.exp(new_log_weight)
-        self._shape_state = new_shape_state
-        self._shape_cov = new_shape_cov
+    def _select_shape_candidates(self, candidates: List[_ShapeCandidate]) -> List[_ShapeCandidate]:
+        if self._component_pairing_mode == "all" or len(candidates) <= 1:
+            return candidates
+
+        selected: List[_ShapeCandidate] = []
+        prior_ids = sorted({c.prior_id for c in candidates})
+        for prior_id in prior_ids:
+            cur = [c for c in candidates if c.prior_id == prior_id]
+            if not cur:
+                continue
+            best_score = max(c.score for c in cur)
+            if self._component_pairing_mode == "best":
+                selected.append(max(cur, key=lambda c: c.score))
+            elif self._component_pairing_mode == "gated":
+                keep = [c for c in cur if c.score >= best_score - self._component_gate_log_weight]
+                selected.extend(keep if keep else [max(cur, key=lambda c: c.score)])
+            else:
+                raise ValueError(f"Unknown component_pairing_mode: {self._component_pairing_mode}")
+        return selected
 
     def _component_log_weight(
         self,
@@ -400,11 +526,36 @@ class UnknownCorrelationFusionCenter(FusionCenter):
         prior_cov: np.ndarray,
         meas_mean: np.ndarray,
         meas_cov: np.ndarray,
+        omega: float,
     ) -> float:
         if self._component_weight_mode == "uniform":
             return 0.0
         if self._component_weight_mode == "prior":
             return float(prior_log_weight + meas_log_weight)
+        if self._component_weight_mode == "chernoff":
+            if self._unknown_corr_method == "ci":
+                return float(
+                    prior_log_weight
+                    + meas_log_weight
+                    + chernoff_log_normalizer(prior_mean, prior_cov, meas_mean, meas_cov, omega)
+                )
+            # ICI is not a Chernoff/geometric-mean density.  Use the geometry
+            # compatibility fallback rather than silently pretending otherwise.
+            return float(
+                prior_log_weight
+                + meas_log_weight
+                + _esr_log_gaussian_compatibility(
+                    prior_mean, prior_cov, meas_mean, meas_cov, self._compatibility_scale
+                )
+            )
+        if self._component_weight_mode == "esr_likelihood":
+            return float(
+                prior_log_weight
+                + meas_log_weight
+                + _esr_log_gaussian_compatibility(
+                    prior_mean, prior_cov, meas_mean, meas_cov, self._compatibility_scale
+                )
+            )
         if self._component_weight_mode != "likelihood":
             raise ValueError(f"Unknown component_weight_mode: {self._component_weight_mode}")
 
@@ -412,6 +563,25 @@ class UnknownCorrelationFusionCenter(FusionCenter):
         diff[0] = ((diff[0] + np.pi) % (2.0 * np.pi)) - np.pi
         compat_cov = self._compatibility_scale * (prior_cov + meas_cov)
         return float(prior_log_weight + meas_log_weight + _log_gaussian_pdf(diff, compat_cov))
+
+    def _component_pairing_score(
+        self,
+        prior_log_weight: float,
+        meas_log_weight: float,
+        prior_mean: np.ndarray,
+        prior_cov: np.ndarray,
+        meas_mean: np.ndarray,
+        meas_cov: np.ndarray,
+    ) -> float:
+        """Geometry-aware score used only for best/gated RED chart selection."""
+
+        return float(
+            prior_log_weight
+            + meas_log_weight
+            + _esr_log_gaussian_compatibility(
+                prior_mean, prior_cov, meas_mean, meas_cov, self._compatibility_scale
+            )
+        )
 
     def _set_point_estimate(self) -> None:
         if self._estimate_samples <= 0:

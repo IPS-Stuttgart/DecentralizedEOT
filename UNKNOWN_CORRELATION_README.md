@@ -1,66 +1,65 @@
-# RED fusion under unknown correlation
+# Unknown-correlation RED fusion add-on
 
-This add-on targets the repository:
+This add-on extends `Fusion_2022_Thormann_RED-IF` with conservative track-to-track fusion when the cross-correlation/common information between local ellipse tracks is unknown.
 
-```text
-Fusion-Goettingen/Fusion_2022_Thormann_RED-IF
-```
+The original RED-IF code is still the correct reference when the common prior and process noise are known. The unknown-correlation add-on is meant for the harder case where that information is missing, approximate, stale, or supplied by a black-box tracker.
 
-It adds a conservative RED track-to-track fusion baseline for the case where the
-cross-correlation / common information between local ellipse tracks is unknown.
-The original RED-IF method should remain the sharper reference when the common
-prior and process information are known.  This patch is for the complementary
-unknown-correlation case.
+## Added methods
 
-## Added files
+### RED-CI
+
+Component-wise covariance intersection inside the RED representation:
 
 ```text
-Filters/fusioncenter_unknowncorr.py
-run_red_unknown_corr_experiment.py
-tests/test_unknown_corr_fusion.py
+RED component alignment -> Gaussian CI -> RED mixture reduction -> MMGW estimate
 ```
 
-No existing repository file has to be edited for the first test.
+This is the safest baseline. It does not require a cross-covariance.
 
-## What the new fusion class does
+### RED-ICI
 
-`UnknownCorrelationFusionCenter` keeps the original RED representation and MMGW
-point-estimate logic, but replaces the Kalman/information-form product update by
-component-wise conservative fusion:
+Experimental inverse covariance intersection. It is usually sharper than CI, but it should be treated as an ablation rather than the main conservative result.
 
-1. Convert the incoming shape estimate to a four-component RED via `turn_mult`.
-2. Align each incoming RED component to the current global RED component's angle
-   chart.
-3. Fuse each aligned component pair using covariance intersection:
+### RED-GCI / RED-GCI-ESR
 
-   ```text
-   C_f(omega) = inv(omega inv(C_a) + (1 - omega) inv(C_b))
-   m_f(omega) = C_f(omega) [omega inv(C_a) m_a + (1 - omega) inv(C_b) m_b]
-   ```
+This improvement treats covariance intersection as a Chernoff/geometric-mean density fusion and uses the corresponding Gaussian normalization coefficient as the RED component-pair weight. This is more principled than an independence-style likelihood weight for unknown correlations.
 
-4. Select `omega` by minimizing `logdet(C_f)` or `trace(C_f)`.
-5. Reduce the resulting RED mixture and compute the MMGW/ESR estimate.
+The `ESR` variant also chooses the CI weight for the shape part in the RED/MMGW square-root geometry:
 
-An experimental ICI mode is also available with `unknown_corr_method="ici"`.
-CI should be the baseline for robust unknown-correlation tests.
+```text
+[alpha, length, width] -> [S_11, S_12, S_22]
+S = R(alpha) diag(length, width) R(alpha)^T
+```
 
-## Smoke test
+This aligns the weight selection with the square-root-space approximation used by the MMGW estimator.
 
-From the repository root after copying the files:
+## New options in `UnknownCorrelationFusionCenter`
+
+```python
+unknown_corr_method="ci"          # "ci" or "ici"
+omega_criterion="logdet"          # backward-compatible criterion for both state parts
+kin_omega_criterion="logdet"      # "logdet" or "trace"
+shape_omega_criterion="esr_trace" # "logdet", "trace", "esr_trace", "esr_logdet"
+component_weight_mode="chernoff"  # "likelihood", "esr_likelihood", "chernoff", "prior", "uniform"
+component_pairing_mode="gated"    # "all", "best", "gated"
+component_gate_log_weight=12.0
+```
+
+## Suggested paper baselines
+
+Run the original unknown-correlation baseline:
 
 ```bash
-python -m pytest tests/test_unknown_corr_fusion.py
-python run_red_unknown_corr_experiment.py --runs 20 --time-steps 15 --seed 7 --estimate-samples 300
+python run_red_unknown_corr_experiment.py \
+  --runs 1000 \
+  --time-steps 15 \
+  --scenario 1 \
+  --seed 7 \
+  --omega-grid-size 31 \
+  --estimate-samples 1000
 ```
 
-Expected behavior in the tests:
-
-* Identical estimates fused by CI keep the same covariance, rather than shrinking
-  to half covariance as an independent-information product would.
-* RED alignment finds the equivalent axis-swapped representation of the same
-  ellipse.
-
-## Longer experiment
+Run with the proposed RED-GCI/ESR preset:
 
 ```bash
 python run_red_unknown_corr_experiment.py \
@@ -70,32 +69,28 @@ python run_red_unknown_corr_experiment.py \
   --seed 7 \
   --omega-grid-size 31 \
   --estimate-samples 1000 \
-  --include-ici
+  --include-gci-esr
 ```
 
-Outputs are written to `plots_unknown_corr/`:
+Run only the proposed preset as the main RED-CI configuration:
 
-```text
-red_unknown_corr_errors.csv
-red_unknown_corr_errors.npz
-gw_error.png
-iou_error.png
-vel_error.png
+```bash
+python run_red_unknown_corr_experiment.py \
+  --runs 1000 \
+  --time-steps 15 \
+  --scenario 1 \
+  --seed 7 \
+  --shape-omega-criterion esr_trace \
+  --component-weight-mode chernoff \
+  --component-pairing-mode gated \
+  --component-gate-log-weight 12 \
+  --omega-grid-size 31
 ```
 
-## Interpretation
+## Tests
 
-The comparison is not expected to show RED-CI always beating RED-IF.  In the
-original paper's setup, RED-IF is allowed to use known common prior/process
-information.  RED-CI deliberately assumes this information is unavailable, so it
-should be judged as a conservative fallback.  The useful comparison is:
-
-```text
-RED normal fusion      : can double-count unknown common information.
-RED information fusion : strong if common information is known.
-RED-CI                 : robust unknown-correlation baseline.
-RED-ICI                : sharper experimental unknown-correlation baseline.
+```bash
+python -m pytest tests/test_unknown_corr_fusion.py
 ```
 
-For a publication-quality extension, add NEES/consistency plots, because the
-main promise of CI is conservatism rather than always lower point-estimate error.
+The tests check that CI does not double-count identical estimates, that the RED square-root transform is invariant to equivalent ellipse parameterizations, that the analytic square-root Jacobian matches a finite-difference Jacobian, and that the Chernoff coefficient behaves correctly for identical Gaussian components.

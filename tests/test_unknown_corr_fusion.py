@@ -10,7 +10,10 @@ import numpy as np
 from Filters.filtersupport import turn_mult
 from Filters.fusioncenter_unknowncorr import (
     align_shape_mean_to_reference,
+    chernoff_log_normalizer,
     fuse_gaussians_unknown_correlation,
+    shape_sqrt_jacobian,
+    shape_to_sqrt_params,
 )
 
 
@@ -54,3 +57,51 @@ def test_red_alignment_finds_equivalent_axis_swapped_representation():
     distances = np.linalg.norm(aligned - reference, axis=1)
 
     assert np.min(distances) < 1e-10
+
+
+def test_square_root_shape_transform_is_red_invariant():
+    reference = np.array([0.3, 6.0, 2.0])
+    equivalent_a = np.array([0.3 + np.pi, 6.0, 2.0])
+    equivalent_b = np.array([0.3 + 0.5 * np.pi, 2.0, 6.0])
+
+    t_ref = shape_to_sqrt_params(reference)
+    np.testing.assert_allclose(shape_to_sqrt_params(equivalent_a), t_ref, atol=1e-12)
+    np.testing.assert_allclose(shape_to_sqrt_params(equivalent_b), t_ref, atol=1e-12)
+
+
+def test_square_root_shape_jacobian_matches_finite_difference():
+    mean = np.array([0.4, 5.0, 1.7])
+    jac = shape_sqrt_jacobian(mean)
+    eps = 1e-6
+    fd = np.zeros((3, 3))
+    for i in range(3):
+        step = np.zeros(3)
+        step[i] = eps
+        fd[:, i] = (shape_to_sqrt_params(mean + step) - shape_to_sqrt_params(mean - step)) / (2.0 * eps)
+    np.testing.assert_allclose(jac, fd, atol=1e-6)
+
+
+def test_chernoff_log_normalizer_is_zero_for_identical_gaussians():
+    mean = np.array([0.3, 5.0, 2.0])
+    cov = np.diag([0.2, 0.5, 0.4])
+    assert abs(chernoff_log_normalizer(mean, cov, mean, cov, 0.23)) < 1e-10
+
+
+def test_esr_criterion_runs_for_shape_ci():
+    mean_a = np.array([0.0, 5.0, 1.5])
+    cov_a = np.diag([0.2, 0.5, 0.2])
+    mean_b = np.array([0.2, 4.8, 1.8])
+    cov_b = np.diag([0.1, 0.8, 0.3])
+
+    fused = fuse_gaussians_unknown_correlation(
+        mean_a,
+        cov_a,
+        mean_b,
+        cov_b,
+        method="ci",
+        criterion="esr_trace",
+        grid_size=9,
+    )
+
+    assert 0.0 <= fused.omega <= 1.0
+    assert np.all(np.linalg.eigvalsh(fused.covariance) > 0.0)
