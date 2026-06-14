@@ -39,9 +39,9 @@ def simulate_data(init, meas_cov):
     for i in range(TIME_STEPS):
         # move along predetermined path
         if i > 0:
-            gt[2] += 0.0 if NO_KIN else np.random.normal(0, SIGMA_V1**2) * TD
-            gt[3] += 0.0 if NO_KIN else np.random.normal(0, SIGMA_V2**2) * TD
-            gt[4] += np.random.normal(0, SIGMA_OR**2) * TD
+            gt[2] += 0.0 if NO_KIN else np.random.normal(0, SIGMA_V1) * TD
+            gt[3] += 0.0 if NO_KIN else np.random.normal(0, SIGMA_V2) * TD
+            gt[4] += np.random.normal(0, SIGMA_OR) * TD
             if not NO_KIN:
                 gt[:2] = gt[:2] + gt[2:4] * TD
 
